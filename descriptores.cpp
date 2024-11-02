@@ -3,15 +3,31 @@
 #include "opencv2/core/hal/interface.h"
 #include "opencv2/core/types.hpp"
 #include "opencv2/objdetect.hpp" // Para el HOG descriptor
-#include <cstdlib>               // Funciones extras, util para terminar procesos
-#include <cstdlib>               // Para system()
+#include <algorithm>             // Para encontrar máximo en un vector
+#include <chrono>                // Medimos tiempo de ejecución
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>    // Funciones extras, util para terminar procesos
+#include <cstdlib>    // Para system()
+#include <filesystem> // Manejar sistemas de archivos, sólo en C++17 (cambio en el Makefile también)
+#include <fstream>    // Para manipular archivos
+#include <iostream>   // Para la entrada y salida
+#include <nlohmann/json.hpp>
 #include <omp.h>
 #include <opencv2/core.hpp> // Con esto importamos OpenCV
 #include <opencv2/features2d.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/opencv.hpp>
+#include <string>
+#include <thread>
 #include <vector>
+
+void normalizeL2(cv::Mat &descriptor)
+{
+    // Normaliza los vectores
+    cv::normalize(descriptor, descriptor, 1, 0, cv::NORM_L2);
+}
 
 void descriptoresGabor(const std::vector<cv::Mat> &imagenes, std::vector<cv::Mat> &descriptoresTextura)
 {
@@ -87,7 +103,8 @@ void descriptoresGabor(const std::vector<cv::Mat> &imagenes, std::vector<cv::Mat
                 }
             }
         }
-        cv::normalize(descriptorImagen, descriptorImagen, 255, 0, cv::NORM_MINMAX);
+        // cv::normalize(descriptorImagen, descriptorImagen, 255, 0, cv::NORM_MINMAX);
+        normalizeL2(descriptorImagen);
         descriptoresTextura[k] = descriptorImagen;
     }
 }
@@ -126,24 +143,32 @@ void momentosHu(const std::vector<cv::Mat> &imagenes, std::vector<cv::Mat> &desc
             }
             cv::pyrDown(imagenActual, imagenActual);
         }
+        normalizeL2(descriptorFinal);
         descriptoresHu[i] = descriptorFinal;
     }
 }
 
 void histogramaIntensidades(const std::vector<cv::Mat> &imagen, std::vector<cv::Mat> &descriptorIntensidad)
 {
-
-    int nbins = 16;
-    float rango[] = {0, 255};
-    const float *rangoHistograma = rango;
+    int nbinsH = 32;            // Cantidad de bins para Hue
+    int nbinsSV = 16;           // Cantidad de bins para saturación e intensidad
+    float rangoH[] = {0, 180};  // Rango Hue
+    float rangoSV[] = {0, 255}; // Rango saturación e intensidad
+    const float *rangoHistogramaH = rangoH;
+    const float *rangoHistogramaSV = rangoSV;
 
     descriptorIntensidad.resize(imagen.size());
     size_t i;
+
 #pragma omp parallel for private(i)
     for (i = 0; i < imagen.size(); i++)
     {
         cv::Mat imagenActual = imagen[i];
+        std::vector<cv::Mat> canalesHSV;
+        cv::split(imagenActual, canalesHSV); // Separar los canales (H, S, V)
+
         cv::Mat descriptorImagen;
+
         for (size_t h = 0; h < 6; h++)
         {
             for (int y = 0; y < imagenActual.cols; y += imagenActual.cols / 4)
@@ -151,17 +176,42 @@ void histogramaIntensidades(const std::vector<cv::Mat> &imagen, std::vector<cv::
                 for (int x = 0; x < imagenActual.rows; x += imagenActual.rows / 4)
                 {
                     cv::Rect bloque(x, y, imagenActual.cols / 4, imagenActual.rows / 4);
-                    cv::Mat bloqueImagen = imagenActual(bloque);
-                    cv::Mat histograma;
-                    cv::calcHist(&bloqueImagen, 1, 0, cv::Mat(), histograma, 1, &nbins, &rangoHistograma);
-                    cv::normalize(histograma, histograma, 255, 0, cv::NORM_MINMAX);
-                    histograma.reshape(1, histograma.cols);
-                    descriptorImagen.push_back(histograma);
+
+                    // Separar en cada canal separado
+                    cv::Mat bloqueH = canalesHSV[0](bloque);
+                    cv::Mat bloqueS = canalesHSV[1](bloque);
+                    cv::Mat bloqueV = canalesHSV[2](bloque);
+
+                    cv::Mat histogramaH, histogramaS, histogramaV;
+
+                    // Histograma HUE
+                    cv::calcHist(&bloqueH, 1, 0, cv::Mat(), histogramaH, 1, &nbinsH, &rangoHistogramaH);
+                    cv::normalize(histogramaH, histogramaH, 255, 0, cv::NORM_MINMAX);
+                    histogramaH = histogramaH.reshape(1, 1); // Flatten to a single row
+
+                    // Histograma Saturación
+                    cv::calcHist(&bloqueS, 1, 0, cv::Mat(), histogramaS, 1, &nbinsSV, &rangoHistogramaSV);
+                    cv::normalize(histogramaS, histogramaS, 255, 0, cv::NORM_MINMAX);
+                    histogramaS = histogramaS.reshape(1, 1);
+
+                    // Histograma intensidad
+                    cv::calcHist(&bloqueV, 1, 0, cv::Mat(), histogramaV, 1, &nbinsSV, &rangoHistogramaSV);
+                    cv::normalize(histogramaV, histogramaV, 255, 0, cv::NORM_MINMAX);
+                    histogramaV = histogramaV.reshape(1, 1);
+
+                    // Concatenación de todo...
+                    cv::Mat histogramaBloque;
+                    cv::hconcat(histogramaH, histogramaS, histogramaBloque);
+                    cv::hconcat(histogramaBloque, histogramaV, histogramaBloque);
+
+                    descriptorImagen.push_back(histogramaBloque);
                 }
             }
             cv::pyrDown(imagenActual, imagenActual);
+            cv::split(imagenActual, canalesHSV);
         }
 
+        normalizeL2(descriptorImagen);
         descriptorIntensidad[i] = descriptorImagen;
     }
 }
@@ -205,6 +255,7 @@ void descriptorHOG(const std::vector<cv::Mat> &imagenes, std::vector<cv::Mat> &d
             }
             cv::pyrDown(imagenActual, imagenActual);
         }
+        normalizeL2(descriptorImagen);
         descriptorBorde[i] = descriptorImagen;
     }
 }

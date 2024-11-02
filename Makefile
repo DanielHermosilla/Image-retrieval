@@ -21,10 +21,12 @@ LDFLAGS += -pthread
 
 
 ########## árchivos compilar ##########
-MAIN_CPP := indexar.cpp 
+MAIN_CPP := indexar.cpp
+MAIN_CPP2 := buscar.cpp
 
 ########## Archivos a generar ##########
 MAIN_BIN := bin/$(basename $(MAIN_CPP))
+MAIN_BIN2 := bin/$(basename $(MAIN_CPP2))
 
 ########## Reglas de compilación ##########
 # Reglas all y clean no corresponden a archivos
@@ -34,10 +36,15 @@ MAIN_BIN := bin/$(basename $(MAIN_CPP))
 .PRECIOUS: build/%.o
 
 # Por defecto se generan todos los ejecutables de los ejemplos
-all: $(MAIN_BIN)
+all: $(MAIN_BIN) $(MAIN_BIN2)
 
 # Para cada ejecutable se requiere el object correspondiente más los helpers
 $(MAIN_BIN): build/$(basename $(MAIN_CPP)).o build/descriptores.o
+	mkdir -p "$(@D)"
+	$(CXX) $^ -o $@ $(LDFLAGS)
+
+# Para cada ejecutable se requiere el object correspondiente más los helpers
+$(MAIN_BIN2): build/$(basename $(MAIN_CPP2)).o build/descriptores.o
 	mkdir -p "$(@D)"
 	$(CXX) $^ -o $@ $(LDFLAGS)
 
@@ -45,6 +52,11 @@ $(MAIN_BIN): build/$(basename $(MAIN_CPP)).o build/descriptores.o
 build/$(basename $(MAIN_CPP)).o: $(MAIN_CPP)
 	mkdir -p "$(@D)"
 	$(CXX) -c $(CFLAGS) -o $@ $<
+
+build/$(basename $(MAIN_CPP2)).o: $(MAIN_CPP2)
+	mkdir -p "$(@D)"
+	$(CXX) -c $(CFLAGS) -o $@ $<
+
 
 build/descriptores.o: descriptores.cpp descriptores.h
 	mkdir -p "$(@D)"

@@ -3,14 +3,17 @@
 #include "opencv2/core/hal/interface.h"
 #include "opencv2/core/mat.hpp"
 #include "opencv2/core/types.hpp"
-#include <algorithm>  // Para encontrar máximo en un vector
-#include <chrono>     // Medimos tiempo de ejecución
+#include "opencv2/objdetect.hpp" // Para el HOG descriptor
+#include <algorithm>             // Para encontrar máximo en un vector
+#include <chrono>                // Medimos tiempo de ejecución
+#include <cmath>
+#include <cstdint>
 #include <cstdlib>    // Funciones extras, util para terminar procesos
 #include <cstdlib>    // Para system()
 #include <filesystem> // Manejar sistemas de archivos, sólo en C++17 (cambio en el Makefile también)
 #include <fstream>    // Para manipular archivos
 #include <iostream>   // Para la entrada y salida
-#include <numeric>
+#include <nlohmann/json.hpp>
 #include <omp.h>
 #include <opencv2/core.hpp> // Con esto importamos OpenCV
 #include <opencv2/features2d.hpp>
@@ -21,6 +24,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+
 namespace fs = std::filesystem;
 double global_max = 20;
 void visualizar_magnitud(const cv::Mat &frec_complex, cv::Mat &imageLogMagnitud)
@@ -67,48 +71,57 @@ cv::Mat imagenCentrada(const cv::Mat &imageLogMagnitud)
 }
 
 void leerImagenes(const std::string &carpeta, std::vector<std::string> &archivos, std::vector<cv::Mat> &imagenG,
-                  std::vector<cv::Mat> &imagenTransformada, std::vector<cv::Mat> &imagenNoResize)
+                  std::vector<cv::Mat> &imagenTransformada, std::vector<cv::Mat> &imagenNoResize,
+                  std::vector<cv::Mat> &imagenColor)
 {
-    // Esta función debe leer el directorio de imagenes que se pasa con
-    // el argumento de "carpeta", por el otro lado, el argumento "archivo" tiene una
-    // referencia a los nombre de las imagenes
-
     std::cout << "Se empiezan a leer las imagenes" << std::endl;
 
-    // Iteración de los archivos, adaptación de la función util.py
+    // Step 1: Collect file paths into a vector
+    std::vector<fs::path> file_paths;
     for (const auto &entrada : fs::directory_iterator(carpeta))
     {
-
         if (fs::is_regular_file(entrada.path()) && entrada.path().extension() == ".jpg")
         {
-            std::string nombre =
-                entrada.path().filename().string(); // Ocupamos .stem() para obtener el nombre sin la extensión
-            archivos.push_back(nombre);
-
-            cv::Mat imagen_gris = cv::imread(entrada.path().string(), cv::IMREAD_GRAYSCALE); // Lo mismo pero en gris
-            if (imagen_gris.empty())
-            {
-                std::cerr << "Error en pasar a matriz la imagen: " << nombre << std::endl;
-                exit(1); // Se termina todo el proceso
-            }
-
-            // Aprovechamos de redimensionar
-            imagenNoResize.push_back(imagen_gris);
-            cv::Mat imagenGrisFourier;
-            cv::resize(imagen_gris, imagenGrisFourier, cv::Size(20, 20), 0, 0, cv::INTER_AREA);
-
-            cv::resize(imagen_gris, imagen_gris, cv::Size(256, 256), 0, 0, cv::INTER_AREA);
-
-            // Dado que ya se está en la iteración, se aprovecha de calcular la DFT
-            cv::Mat imagenPushFourier, imagenPushLog;
-            imagenGrisFourier.convertTo(imagenPushFourier, CV_32F);
-            cv::dft(imagenPushFourier, imagenPushFourier, cv::DFT_COMPLEX_OUTPUT);
-            visualizar_magnitud(imagenPushFourier, imagenPushLog);
-            // Añadimos al vector de imagen de tipo Mat
-            imagenG.push_back(imagen_gris);
-            imagenTransformada.push_back(imagenPushLog);
+            file_paths.push_back(entrada.path());
         }
     }
+
+// Step 2: Parallel processing with OpenMP
+#pragma omp parallel for
+    for (size_t i = 0; i < file_paths.size(); ++i)
+    {
+        const fs::path &file_path = file_paths[i];
+        std::string nombre = file_path.filename().string();
+        cv::Mat imagen_color = cv::imread(file_path.string(), cv::IMREAD_COLOR);
+        cv::Mat imagen_gris = cv::imread(file_path.string(), cv::IMREAD_GRAYSCALE);
+        if (imagen_color.empty())
+        {
+#pragma omp critical
+            std::cerr << "Error al cargar la imagen: " << nombre << std::endl;
+            continue;
+        }
+
+        // Resize and process images
+        cv::Mat imagenGrisFourier, imagenPushFourier, imagenPushLog;
+        cv::resize(imagen_gris, imagenGrisFourier, cv::Size(20, 20), 0, 0, cv::INTER_AREA);
+        cv::resize(imagen_gris, imagen_gris, cv::Size(256, 256), 0, 0, cv::INTER_AREA);
+        cv::resize(imagen_color, imagen_color, cv::Size(256, 256), 0, 0, cv::INTER_AREA);
+
+        imagenGrisFourier.convertTo(imagenPushFourier, CV_32F);
+        cv::dft(imagenPushFourier, imagenPushFourier, cv::DFT_COMPLEX_OUTPUT);
+        visualizar_magnitud(imagenPushFourier, imagenPushLog);
+
+// Store results in shared vectors (order not guaranteed)
+#pragma omp critical
+        {
+            archivos.push_back(nombre);
+            imagenNoResize.push_back(imagen_gris);
+            imagenG.push_back(imagen_gris);
+            imagenTransformada.push_back(imagenPushLog);
+            imagenColor.push_back(imagen_color);
+        }
+    }
+
     std::cout << "Se terminó de leer las imagenes" << std::endl;
 }
 
@@ -169,14 +182,15 @@ void leer_imagenes(const std::string &carpeta_entrada, const std::string &carpet
     std::vector<cv::Mat> imagenesQ;
     std::vector<cv::Mat> imagenesQTransformada;
     std::vector<cv::Mat> imagenesNoResize;
+    std::vector<cv::Mat> imagenesColor;
 
     leerYML(carpeta_descriptores, nombresR, descriptorTexturaR, descriptorIntensidadR, descriptorBordeR, descriptorHuR);
     std::cout << "Se terminó de leer los descriptores de las imágenes calculadas" << std::endl;
     std::cout << "Se empezará a crear los descriptores de la carpeta de entrada" << std::endl;
-    leerImagenes(carpeta_entrada, nombresQ, imagenesQ, imagenesQTransformada, imagenesNoResize);
+    leerImagenes(carpeta_entrada, nombresQ, imagenesQ, imagenesQTransformada, imagenesNoResize, imagenesColor);
     // Se corren en paralelo, son procesos independientes
     std::thread t1(descriptoresGabor, imagenesQTransformada, std::ref(descriptorTexturaQ));
-    std::thread t2(histogramaIntensidades, imagenesQ, std::ref(descriptorIntensidadQ));
+    std::thread t2(histogramaIntensidades, imagenesColor, std::ref(descriptorIntensidadQ));
     std::thread t3(descriptorHOG, imagenesQ, std::ref(descriptorBordeQ));
     std::thread t4(momentosHu, imagenesNoResize, std::ref(descriptorHuQ));
     t1.join();
@@ -233,17 +247,21 @@ void leer_imagenes(const std::string &carpeta_entrada, const std::string &carpet
         size_t min_indiceBorde2 = std::distance(distanciasBorde.begin(), min_indiceBorde);
 #pragma omp critical
         {
-            if (min_valorTextura <= 70)
+
+            if (min_valorTextura <= 0.021)
+            // if (false)
             {
                 // Precisión es de aprox 371/377 = 98.4%
                 outfile << nombresQ[i] << "\t" << nombresR[min_indiceTextura2] << "\t" << min_valorTextura << std::endl;
             }
-            else if (min_valorBorde <= 5800)
+            else if (min_valorBorde <= 0.369)
+            // else if (false)
             {
                 // Precisión es de aprox 637/645= 98,6%
                 outfile << nombresQ[i] << "\t" << nombresR[min_indiceBorde2] << "\t" << min_valorBorde << std::endl;
             }
-            else if (min_valorHu <= 65000)
+            else if (min_valorHu <= 2.6115e-06)
+            // else if (true)
             {
                 // Precisión es de aprox 44/46 = 95.6%
                 outfile << nombresQ[i] << "\t" << nombresR[min_indiceHu2] << "\t" << min_valorHu << std::endl;
@@ -251,6 +269,7 @@ void leer_imagenes(const std::string &carpeta_entrada, const std::string &carpet
 
             else
             {
+
                 outfile << nombresQ[i] << "\t" << nombresR[min_indiceIntensidad2] << "\t" << min_valorIntensidad
                         << std::endl;
             }
@@ -279,10 +298,7 @@ int main(int argc, char *argv[])
     std::string carpeta_descriptores = argv[2];
     std::string output_file = argv[3];
 
-    auto inicio = std::chrono::high_resolution_clock::now();
     leer_imagenes(carpeta_entrada, carpeta_descriptores, output_file);
-    auto fin = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> duracion = fin - inicio;
-    std::cout << "Tiempo de ejecución del programa de indexación: " << duracion.count() << " segundos" << std::endl;
+
     return 0;
 }
